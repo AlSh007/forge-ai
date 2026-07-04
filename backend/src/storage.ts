@@ -105,6 +105,21 @@ export interface CreatePullRequestInput {
 export interface ListTasksOptions {
   limit?: number;
   offset?: number;
+  /** When set, only tasks owned by this user are returned. */
+  userId?: string;
+}
+
+export interface UpsertUserInput {
+  supabaseUserId: string;
+  email: string;
+  name?: string | null;
+}
+
+export interface UserProfile {
+  email: string;
+  name: string | null;
+  githubUsername: string | null;
+  hasGithubToken: boolean;
 }
 
 // Statuses that mean a task was mid-execution. If the process died (deploy,
@@ -121,6 +136,13 @@ interface StorageAdapter {
   listTasks(options?: ListTasksOptions): Promise<TaskRecord[]>;
   getTaskById(id: string): Promise<TaskRecord | null>;
   markInterruptedTasksFailed(): Promise<number>;
+  // Auth: map a Supabase identity to a local User (returns the local userId),
+  // and manage that user's encrypted GitHub token. The token is stored/returned
+  // as an opaque encrypted string — callers encrypt/decrypt (see crypto.ts).
+  upsertUserBySupabaseId(input: UpsertUserInput): Promise<string>;
+  setUserGithubToken(userId: string, encryptedToken: string, githubUsername?: string | null): Promise<void>;
+  getEncryptedGithubToken(userId: string): Promise<string | null>;
+  getUserProfile(userId: string): Promise<UserProfile | null>;
   createTask(input: CreateTaskInput): Promise<TaskRecord>;
   updateTask(id: string, input: UpdateTaskInput): Promise<TaskRecord | null>;
   createExecution(input: CreateExecutionInput): Promise<AgentExecutionRecord>;
@@ -260,11 +282,21 @@ function toTaskRecord(
   };
 }
 
+interface MemoryUser {
+  id: string;
+  email: string;
+  name: string | null;
+  supabaseUserId?: string;
+  githubUsername: string | null;
+  githubAccessToken: string | null;
+}
+
 export class MemoryStorage implements StorageAdapter {
   private tasks = new Map<string, TaskRecord>();
   private executions = new Map<string, AgentExecutionRecord[]>();
   private logs = new Map<string, ExecutionLogRecord[]>();
   private pullRequests = new Map<string, PullRequestRecord[]>();
+  private users = new Map<string, MemoryUser>();
   private readonly defaultUserId = 'local-user';
 
   async connect(): Promise<void> {
@@ -272,13 +304,71 @@ export class MemoryStorage implements StorageAdapter {
   }
 
   async listTasks(options?: ListTasksOptions): Promise<TaskRecord[]> {
-    const sorted = Array.from(this.tasks.values()).sort((left, right) =>
-      right.createdAt.localeCompare(left.createdAt)
-    );
+    let all = Array.from(this.tasks.values());
+    if (options?.userId != null) {
+      all = all.filter((task) => task.userId === options.userId);
+    }
+    const sorted = all.sort((left, right) => right.createdAt.localeCompare(left.createdAt));
     const offset = options?.offset ?? 0;
     const windowed =
       options?.limit != null ? sorted.slice(offset, offset + options.limit) : sorted.slice(offset);
     return windowed.map((task) => this.withRelations(task));
+  }
+
+  async upsertUserBySupabaseId(input: UpsertUserInput): Promise<string> {
+    // Exact Supabase-identity match — same person, safe to update.
+    for (const user of this.users.values()) {
+      if (user.supabaseUserId === input.supabaseUserId) {
+        user.email = input.email;
+        user.name = input.name ?? user.name;
+        return user.id;
+      }
+    }
+    // Adopt an UNBOUND legacy row with the same email; never rebind a row already
+    // tied to a different Supabase identity (see PrismaStorage note — takeover).
+    for (const user of this.users.values()) {
+      if (user.email === input.email && user.supabaseUserId == null) {
+        user.supabaseUserId = input.supabaseUserId;
+        user.name = input.name ?? user.name;
+        return user.id;
+      }
+    }
+    const id = randomUUID();
+    this.users.set(id, {
+      id,
+      email: input.email,
+      name: input.name ?? null,
+      supabaseUserId: input.supabaseUserId,
+      githubUsername: null,
+      githubAccessToken: null,
+    });
+    return id;
+  }
+
+  async setUserGithubToken(
+    userId: string,
+    encryptedToken: string,
+    githubUsername?: string | null
+  ): Promise<void> {
+    const user = this.users.get(userId);
+    if (!user) return;
+    user.githubAccessToken = encryptedToken;
+    if (githubUsername !== undefined) user.githubUsername = githubUsername;
+  }
+
+  async getEncryptedGithubToken(userId: string): Promise<string | null> {
+    return this.users.get(userId)?.githubAccessToken ?? null;
+  }
+
+  async getUserProfile(userId: string): Promise<UserProfile | null> {
+    const user = this.users.get(userId);
+    if (!user) return null;
+    return {
+      email: user.email,
+      name: user.name,
+      githubUsername: user.githubUsername,
+      hasGithubToken: !!user.githubAccessToken,
+    };
   }
 
   async getTaskById(id: string): Promise<TaskRecord | null> {
@@ -475,6 +565,7 @@ class PrismaStorage implements StorageAdapter {
 
   async listTasks(options?: ListTasksOptions): Promise<TaskRecord[]> {
     const tasks = await this.prisma.task.findMany({
+      ...(options?.userId != null && { where: { userId: options.userId } }),
       orderBy: {
         createdAt: 'desc',
       },
@@ -483,6 +574,85 @@ class PrismaStorage implements StorageAdapter {
     });
 
     return tasks.map((task: any) => toTaskRecord(task));
+  }
+
+  async upsertUserBySupabaseId(input: UpsertUserInput): Promise<string> {
+    // Prefer matching on the Supabase identity; fall back to linking a pre-existing
+    // row with the same email (avoids a unique-email violation), else create.
+    const bySupabase = await this.prisma.user.findUnique({
+      where: { supabaseUserId: input.supabaseUserId },
+      select: { id: true },
+    });
+    if (bySupabase) {
+      await this.prisma.user.update({
+        where: { id: bySupabase.id },
+        data: { email: input.email, name: input.name ?? undefined },
+      });
+      return bySupabase.id;
+    }
+
+    const byEmail = await this.prisma.user.findUnique({
+      where: { email: input.email },
+      select: { id: true, supabaseUserId: true },
+    });
+    // Adopt a pre-existing row ONLY if it has no Supabase identity yet (a legacy/
+    // local row). Never rebind a row already owned by a *different* Supabase
+    // identity — doing so would be an account-takeover primitive (an attacker with
+    // a matching email claim could seize the victim's tasks and stored GitHub token).
+    if (byEmail && byEmail.supabaseUserId == null) {
+      await this.prisma.user.update({
+        where: { id: byEmail.id },
+        data: { supabaseUserId: input.supabaseUserId, name: input.name ?? undefined },
+      });
+      return byEmail.id;
+    }
+
+    const created = await this.prisma.user.create({
+      data: {
+        email: input.email,
+        name: input.name ?? null,
+        supabaseUserId: input.supabaseUserId,
+      },
+      select: { id: true },
+    });
+    return created.id;
+  }
+
+  async setUserGithubToken(
+    userId: string,
+    encryptedToken: string,
+    githubUsername?: string | null
+  ): Promise<void> {
+    await this.prisma.user.update({
+      where: { id: userId },
+      data: {
+        githubAccessToken: encryptedToken,
+        githubTokenUpdatedAt: new Date(),
+        ...(githubUsername !== undefined && { githubUsername }),
+      },
+    });
+  }
+
+  async getEncryptedGithubToken(userId: string): Promise<string | null> {
+    const user = await this.prisma.user.findUnique({
+      where: { id: userId },
+      select: { githubAccessToken: true },
+    });
+    return user?.githubAccessToken ?? null;
+  }
+
+  async getUserProfile(userId: string): Promise<UserProfile | null> {
+    const user = await this.prisma.user.findUnique({
+      where: { id: userId },
+      select: { email: true, name: true, githubUsername: true, githubAccessToken: true },
+    });
+    if (!user) return null;
+    return {
+      email: user.email,
+      name: user.name,
+      githubUsername: user.githubUsername,
+      hasGithubToken: !!user.githubAccessToken,
+    };
   }
 
   async markInterruptedTasksFailed(): Promise<number> {
@@ -719,6 +889,26 @@ class ForgeStorage implements StorageAdapter {
 
   async markInterruptedTasksFailed(): Promise<number> {
     return (await this.getAdapter()).markInterruptedTasksFailed();
+  }
+
+  async upsertUserBySupabaseId(input: UpsertUserInput): Promise<string> {
+    return (await this.getAdapter()).upsertUserBySupabaseId(input);
+  }
+
+  async setUserGithubToken(
+    userId: string,
+    encryptedToken: string,
+    githubUsername?: string | null
+  ): Promise<void> {
+    return (await this.getAdapter()).setUserGithubToken(userId, encryptedToken, githubUsername);
+  }
+
+  async getEncryptedGithubToken(userId: string): Promise<string | null> {
+    return (await this.getAdapter()).getEncryptedGithubToken(userId);
+  }
+
+  async getUserProfile(userId: string): Promise<UserProfile | null> {
+    return (await this.getAdapter()).getUserProfile(userId);
   }
 
   async createTask(input: CreateTaskInput): Promise<TaskRecord> {

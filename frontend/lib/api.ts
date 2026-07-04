@@ -1,4 +1,5 @@
 import axios from 'axios';
+import { supabase } from './supabase';
 
 export type TaskStatus =
   | 'PENDING'
@@ -102,6 +103,42 @@ export const apiClient = axios.create({
     'Content-Type': 'application/json',
   },
 });
+
+// Attach the current Supabase access token (JWT) to every request. The backend
+// verifies it and resolves the authenticated user.
+apiClient.interceptors.request.use(async (config) => {
+  const { data } = await supabase.auth.getSession();
+  const token = data.session?.access_token;
+  if (token) {
+    config.headers.Authorization = `Bearer ${token}`;
+  }
+  return config;
+});
+
+// On 401 the session is invalid/expired — sign out so the app returns to login.
+apiClient.interceptors.response.use(
+  (response) => response,
+  async (error) => {
+    if (error?.response?.status === 401) {
+      await supabase.auth.signOut();
+    }
+    return Promise.reject(error);
+  }
+);
+
+export interface UserProfile {
+  email: string;
+  name: string | null;
+  githubUsername: string | null;
+  hasGithubToken: boolean;
+}
+
+export const authApi = {
+  me: async (): Promise<{ user: UserProfile }> => (await apiClient.get('/api/auth/me')).data,
+  storeGithubToken: async (providerToken: string, githubUsername?: string): Promise<void> => {
+    await apiClient.post('/api/auth/github', { providerToken, githubUsername });
+  },
+};
 
 // Task API calls
 export const taskApi = {

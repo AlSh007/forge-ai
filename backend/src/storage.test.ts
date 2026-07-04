@@ -262,4 +262,72 @@ describe('MemoryStorage', () => {
       expect(await storage.listPullRequestsByTaskId(task.id)).toEqual([]);
     });
   });
+
+  // ── Auth: per-user scoping + GitHub token ───────────────────────────────────
+
+  describe('listTasks user scoping', () => {
+    it('returns only the given user\'s tasks when userId is provided', async () => {
+      const storage = makeStorage();
+      const a = await storage.createTask({ prompt: PROMPT, repositoryUrl: REPO_URL, userId: 'user-a' });
+      await storage.createTask({ prompt: PROMPT, repositoryUrl: REPO_URL, userId: 'user-b' });
+
+      const forA = await storage.listTasks({ userId: 'user-a' });
+      expect(forA).toHaveLength(1);
+      expect(forA[0].id).toBe(a.id);
+      expect(forA[0].userId).toBe('user-a');
+    });
+
+    it('returns all tasks when no userId filter is given (backwards compatible)', async () => {
+      const storage = makeStorage();
+      await storage.createTask({ prompt: PROMPT, repositoryUrl: REPO_URL, userId: 'user-a' });
+      await storage.createTask({ prompt: PROMPT, repositoryUrl: REPO_URL, userId: 'user-b' });
+      expect(await storage.listTasks()).toHaveLength(2);
+    });
+  });
+
+  describe('user auth methods', () => {
+    it('upserts a user by supabase id and returns a stable id', async () => {
+      const storage = makeStorage();
+      const id1 = await storage.upsertUserBySupabaseId({ supabaseUserId: 'sb-1', email: 'a@x.com', name: 'A' });
+      const id2 = await storage.upsertUserBySupabaseId({ supabaseUserId: 'sb-1', email: 'a@x.com' });
+      expect(id1).toBe(id2);
+    });
+
+    it('does NOT rebind a row already owned by another Supabase identity (no takeover)', async () => {
+      const storage = makeStorage();
+      const first = await storage.upsertUserBySupabaseId({ supabaseUserId: 'sb-1', email: 'shared@x.com' });
+      // A different Supabase identity presenting the same email must not seize the
+      // existing (already-bound) row — it gets its own distinct user instead.
+      const second = await storage.upsertUserBySupabaseId({ supabaseUserId: 'sb-2', email: 'shared@x.com' });
+      expect(second).not.toBe(first);
+    });
+
+    it('stores and reads back an opaque github token', async () => {
+      const storage = makeStorage();
+      const userId = await storage.upsertUserBySupabaseId({ supabaseUserId: 'sb-1', email: 'a@x.com' });
+      expect(await storage.getEncryptedGithubToken(userId)).toBeNull();
+      await storage.setUserGithubToken(userId, 'ENC(token)', 'octocat');
+      expect(await storage.getEncryptedGithubToken(userId)).toBe('ENC(token)');
+    });
+
+    it('reports a profile with the hasGithubToken flag', async () => {
+      const storage = makeStorage();
+      const userId = await storage.upsertUserBySupabaseId({ supabaseUserId: 'sb-1', email: 'a@x.com', name: 'A' });
+      expect(await storage.getUserProfile(userId)).toEqual({
+        email: 'a@x.com',
+        name: 'A',
+        githubUsername: null,
+        hasGithubToken: false,
+      });
+      await storage.setUserGithubToken(userId, 'ENC', 'octocat');
+      const profile = await storage.getUserProfile(userId);
+      expect(profile?.hasGithubToken).toBe(true);
+      expect(profile?.githubUsername).toBe('octocat');
+    });
+
+    it('returns null profile for an unknown user', async () => {
+      const storage = makeStorage();
+      expect(await storage.getUserProfile('nope')).toBeNull();
+    });
+  });
 });

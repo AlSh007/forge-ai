@@ -17,9 +17,20 @@ model User {
   name      String?
   githubId  String?    @unique
   avatar    String?
+
+  // Supabase Auth identity (JWT `sub`). Nullable so the legacy default/local user
+  // and test fixtures without a Supabase identity remain valid.
+  supabaseUserId String? @unique
+
+  // Per-user GitHub OAuth token (captured at login), encrypted at rest via
+  // backend/src/crypto.ts. Used so PRs are attributed to this user.
+  githubUsername       String?
+  githubAccessToken    String?   @db.Text
+  githubTokenUpdatedAt DateTime?
+
   createdAt DateTime   @default(now())
   updatedAt DateTime   @updatedAt
-  
+
   tasks     Task[]
   executions AgentExecution[]
 }

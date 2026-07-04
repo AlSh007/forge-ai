@@ -11,8 +11,27 @@ import {
 import { AgentType, ExecutionStatus, LogLevel, TaskStatus, storage, TaskRecord } from './storage';
 import { createGitHubService, GitHubService } from './github';
 import { registerTask, unregisterTask, requestCancel, isCancelled } from './taskControl';
+import { decryptSecret } from './crypto';
 
 const coordinator = new AgentCoordinator();
+
+/**
+ * Builds a GitHub client for the task owner. Prefers the user's own encrypted
+ * OAuth token (so PRs are attributed to them); falls back to the shared
+ * GITHUB_TOKEN env var for local/dev; returns null if neither is available (PR
+ * creation is then skipped, same as before).
+ */
+async function createGitHubServiceForUser(userId: string): Promise<GitHubService | null> {
+  const encrypted = await storage.getEncryptedGithubToken(userId);
+  if (encrypted) {
+    try {
+      return new GitHubService(decryptSecret(encrypted));
+    } catch (err) {
+      console.error('[execution] Failed to decrypt user GitHub token; falling back to env token.', err);
+    }
+  }
+  return createGitHubService();
+}
 
 // Hard ceiling on a single task run. On the free tier a hung LLM call could
 // otherwise keep a task "running" until the instance is recycled. When exceeded,
@@ -147,7 +166,7 @@ async function finalizeTask(task: TaskRecord, result: TaskExecutionResult): Prom
 }
 
 async function createPRFromResult(task: TaskRecord, result: TaskExecutionResult): Promise<void> {
-  const github = createGitHubService();
+  const github = await createGitHubServiceForUser(task.userId);
   if (!github) {
     await storage.createExecutionLog({
       taskId: task.id,
@@ -252,7 +271,7 @@ async function runExecution(task: TaskRecord): Promise<TaskRecord | null> {
   });
 
   let repoContext: RepoContext | undefined;
-  const github = createGitHubService();
+  const github = await createGitHubServiceForUser(task.userId);
   if (github) {
     try {
       await storage.createExecutionLog({

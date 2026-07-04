@@ -3,8 +3,10 @@ import cors from 'cors';
 import rateLimit from 'express-rate-limit';
 import dotenv from 'dotenv';
 import { executeTask } from './execution';
-import { storage } from './storage';
+import { storage, TaskRecord } from './storage';
 import { requestCancel, isRunning } from './taskControl';
+import { requireAuth } from './auth';
+import { encryptSecret } from './crypto';
 
 // Load environment variables
 dotenv.config();
@@ -49,7 +51,28 @@ const executeLimiter = rateLimit({
 });
 app.use('/api', apiLimiter);
 
+// Every /api route requires a valid Supabase JWT and resolves req.userId.
+// /health stays public (it's not under /api) so the keep-alive ping still works.
+app.use('/api', requireAuth);
+
 const PROMPT_MAX_LENGTH = 2000;
+
+/**
+ * Fetches a task and enforces ownership. Sends a 404 (not 403 — don't leak
+ * existence) and returns null if the task is missing or owned by someone else.
+ */
+async function getOwnedTask(
+  req: Request,
+  res: Response,
+  taskId: string
+): Promise<TaskRecord | null> {
+  const task = await storage.getTaskById(taskId);
+  if (!task || task.userId !== req.userId) {
+    res.status(404).json({ error: 'Task not found.' });
+    return null;
+  }
+  return task;
+}
 const GITHUB_URL_RE = /^https?:\/\/github\.com\/[^/]+\/[^/]+(\.git)?$/i;
 
 function isNonEmptyString(value: unknown): value is string {
@@ -95,7 +118,7 @@ app.get(
   asyncHandler(async (req: Request, res: Response) => {
     const limit = parsePositiveInt(req.query.limit, DEFAULT_PAGE_LIMIT, MAX_PAGE_LIMIT);
     const offset = parsePositiveInt(req.query.offset, 0);
-    const tasks = await storage.listTasks({ limit, offset });
+    const tasks = await storage.listTasks({ limit, offset, userId: req.userId });
     res.json({ tasks, pagination: { limit, offset } });
   })
 );
@@ -124,6 +147,7 @@ app.post(
     const task = await storage.createTask({
       prompt: prompt.trim(),
       repositoryUrl: repositoryUrl.trim(),
+      userId: req.userId,
     });
 
     await storage.createExecutionLog({
@@ -142,12 +166,8 @@ app.post(
 app.get(
   '/api/tasks/:id',
   asyncHandler(async (req: Request, res: Response) => {
-    const task = await storage.getTaskById(req.params.id);
-
-    if (!task) {
-      res.status(404).json({ error: 'Task not found.' });
-      return;
-    }
+    const task = await getOwnedTask(req, res, req.params.id);
+    if (!task) return;
 
     res.json({ task });
   })
@@ -157,12 +177,8 @@ app.post(
   '/api/tasks/:id/execute',
   executeLimiter,
   asyncHandler(async (req: Request, res: Response) => {
-    const task = await storage.getTaskById(req.params.id);
-
-    if (!task) {
-      res.status(404).json({ error: 'Task not found.' });
-      return;
-    }
+    const task = await getOwnedTask(req, res, req.params.id);
+    if (!task) return;
 
     const activeStatuses = ['PLANNING', 'IN_PROGRESS', 'VALIDATING'];
     if (activeStatuses.includes(task.status)) {
@@ -185,12 +201,8 @@ app.post(
 app.post(
   '/api/tasks/:id/cancel',
   asyncHandler(async (req: Request, res: Response) => {
-    const task = await storage.getTaskById(req.params.id);
-
-    if (!task) {
-      res.status(404).json({ error: 'Task not found.' });
-      return;
-    }
+    const task = await getOwnedTask(req, res, req.params.id);
+    if (!task) return;
 
     const activeStatuses = ['PLANNING', 'IN_PROGRESS', 'VALIDATING'];
     if (!activeStatuses.includes(task.status)) {
@@ -229,6 +241,10 @@ app.get(
       return;
     }
 
+    // Ownership: only the task's owner may read its executions.
+    const owned = await getOwnedTask(req, res, taskId);
+    if (!owned) return;
+
     const executions = await storage.listExecutionsByTaskId(taskId);
     res.json({ executions });
   })
@@ -244,8 +260,49 @@ app.get(
       return;
     }
 
+    // Ownership: only the task's owner may read its pull requests.
+    const owned = await getOwnedTask(req, res, taskId);
+    if (!owned) return;
+
     const pullRequests = await storage.listPullRequestsByTaskId(taskId);
     res.json({ pullRequests });
+  })
+);
+
+// ─── Auth ──────────────────────────────────────────────────────────────────
+// Store the caller's GitHub OAuth token (captured client-side at login). It is
+// encrypted at rest and later used to attribute their PRs. requireAuth already
+// ran (global /api middleware), so req.userId is set.
+app.post(
+  '/api/auth/github',
+  asyncHandler(async (req: Request, res: Response) => {
+    const providerToken = req.body.providerToken;
+    const githubUsername = req.body.githubUsername;
+
+    if (!isNonEmptyString(providerToken)) {
+      res.status(400).json({ error: 'providerToken is required.' });
+      return;
+    }
+
+    await storage.setUserGithubToken(
+      req.userId as string,
+      encryptSecret(providerToken.trim()),
+      isNonEmptyString(githubUsername) ? githubUsername.trim() : undefined
+    );
+
+    res.status(204).end();
+  })
+);
+
+app.get(
+  '/api/auth/me',
+  asyncHandler(async (req: Request, res: Response) => {
+    const profile = await storage.getUserProfile(req.userId as string);
+    if (!profile) {
+      res.status(404).json({ error: 'User not found.' });
+      return;
+    }
+    res.json({ user: profile });
   })
 );
 
