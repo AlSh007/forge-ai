@@ -1,0 +1,46 @@
+name: Keep backend warm
+
+# Pings the Render free-tier backend so it doesn't spin down after 15 min idle
+# (cold starts are 30-60s). The ping is inbound traffic, so it also keeps the
+# instance alive while a background task is running.
+#
+# Budget note: Render free is ~750 instance-hours/month per account. This is
+# WINDOWED, not 24/7, to stay under that. The window below (04:00-22:59 UTC,
+# every 10 min) is ~19h/day ≈ 590 instance-hours/month.
+#
+# SET THE URL (one time): repo Settings → Secrets and variables → Actions →
+#   Variables tab → New repository variable
+#   Name: HEALTHCHECK_URL   Value: https://<your-service>.onrender.com/health
+# If unset, it falls back to the default guess below.
+
+on:
+  schedule:
+    # GitHub cron is UTC and can fire several minutes late — fine for keep-alive.
+    # For 24/7 (uses ~the whole free budget) change to:  - cron: '*/10 * * * *'
+    - cron: '*/10 4-22 * * *'
+  workflow_dispatch: {} # allow manual runs (use this to test after setting the URL)
+
+# Never let pings pile up if one is slow (a cold start can take ~60s).
+concurrency:
+  group: keepalive
+  cancel-in-progress: false
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - name: Ping /health
+        run: |
+          URL="${{ vars.HEALTHCHECK_URL || 'https://forgeai-backend.onrender.com/health' }}"
+          echo "Pinging $URL"
+          # Retry to absorb the cold-start wake-up: the first hit can be slow or 502
+          # while the dyno spins back up.
+          for i in 1 2 3 4 5; do
+            code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 90 "$URL" || echo 000)
+            echo "attempt $i -> HTTP $code"
+            if [ "$code" = "200" ]; then exit 0; fi
+            sleep 20
+          done
+          echo "health check did not return 200 after retries"
+          exit 1
