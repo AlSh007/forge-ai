@@ -1,0 +1,48 @@
+name: CI
+
+# Build + test gate for pull requests and pushes to main. Mirrors the real build
+# order: the Prisma client must be generated before the backend compiles, and
+# agent-core must be built before the backend (it imports forgeai-agent-core from
+# agent-core/dist). `npm run build` / `npm run test` at the root already sequence
+# the workspaces correctly (agent-core → backend → frontend).
+#
+# Lint is intentionally not a gate yet: no ESLint config exists in the repo, so
+# `eslint src` / `next lint` would error. Add ESLint config, then wire it here.
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+# Cancel superseded runs on the same ref (e.g. rapid pushes to a PR branch).
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      NEXT_TELEMETRY_DISABLED: '1'
+      CI: 'true'
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Generate Prisma client
+        run: npx prisma generate --schema=backend/prisma/schema.prisma
+
+      - name: Build (agent-core → backend → frontend)
+        run: npm run build
+
+      - name: Test (all workspaces)
+        run: npm run test
