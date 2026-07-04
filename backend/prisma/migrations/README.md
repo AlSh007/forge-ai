@@ -11,25 +11,27 @@ schema changes and removes the risk of a deploy silently dropping columns/data.
 - `0001_add_execution_indexes` — adds indexes on `AgentExecution.taskId` and
   `ExecutionLog.taskId` (both are queried by `taskId` on every task-detail load).
 
-## ONE-TIME baseline step for the existing production database (required once)
+## Baselining is automated — no manual step required
 
-The production Supabase database already has all tables (they were created by the
-old `db push`). Running `migrate deploy` against it directly would fail with
-`P3005: the database schema is not empty` because Prisma has no record of `0_init`
-ever being applied.
+The production Supabase database already has all tables (created by the old
+`db push`), so a plain `migrate deploy` against it would fail with
+`P3005: the database schema is not empty` — Prisma has no record of `0_init`
+being applied.
 
-Before the next deploy, mark the baseline as already-applied **once**, against prod:
+This is handled automatically by `scripts/db-migrate.sh`, which the Render
+`startCommand` runs on every deploy (see `render.yaml`). On the first deploy it
+detects P3005, marks `0_init` as already-applied (baseline), then runs
+`migrate deploy` to apply `0001_...` and anything after. On later deploys it just
+runs `migrate deploy`. The baseline branch triggers only on P3005, so a fresh/empty
+database is never mis-baselined.
+
+If you ever need to baseline a database by hand (e.g. a one-off environment):
 
 ```bash
-# Run locally with the production DATABASE_URL / DIRECT_URL exported,
-# or from a Render shell.
-npx prisma migrate resolve \
-  --applied 0_init \
-  --schema=backend/prisma/schema.prisma
+# With that database's DATABASE_URL / DIRECT_URL exported:
+npx prisma migrate resolve --applied 0_init --schema=backend/prisma/schema.prisma
+npx prisma migrate deploy --schema=backend/prisma/schema.prisma
 ```
-
-After that, every deploy runs `migrate deploy`, which will apply `0001_...` (the
-indexes) and any future migrations. No further manual steps.
 
 ## Creating new migrations going forward
 
