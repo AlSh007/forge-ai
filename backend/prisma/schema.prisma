@@ -68,6 +68,8 @@ model AgentExecution {
   
   task         Task       @relation(fields: [taskId], references: [id], onDelete: Cascade)
   user         User       @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([taskId])
 }
 
 enum AgentType {
@@ -138,8 +140,10 @@ model ExecutionLog {
   taskId       String?
   message      String     @db.Text
   level        LogLevel   @default(INFO)
-  
+
   createdAt    DateTime   @default(now())
+
+  @@index([taskId])
 }
 
 enum LogLevel {

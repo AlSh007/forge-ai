@@ -10,8 +10,14 @@ import {
 } from 'forgeai-agent-core';
 import { AgentType, ExecutionStatus, LogLevel, TaskStatus, storage, TaskRecord } from './storage';
 import { createGitHubService, GitHubService } from './github';
+import { registerTask, unregisterTask, requestCancel, isCancelled } from './taskControl';
 
 const coordinator = new AgentCoordinator();
+
+// Hard ceiling on a single task run. On the free tier a hung LLM call could
+// otherwise keep a task "running" until the instance is recycled. When exceeded,
+// cancellation is requested and the run stops at the next agent-step boundary.
+const TASK_TIMEOUT_MS = Number(process.env.TASK_TIMEOUT_MS ?? 10 * 60 * 1000);
 
 const agentTypeMap: Record<CoordinatorAgentType, AgentType> = {
   [CoordinatorAgentType.PRODUCT_MANAGER]: AgentType.PRODUCT_MANAGER,
@@ -119,17 +125,23 @@ function makeProgressCallback(task: TaskRecord): {
 }
 
 async function finalizeTask(task: TaskRecord, result: TaskExecutionResult): Promise<TaskRecord | null> {
-  const nextStatus = result.success ? TaskStatus.COMPLETED : TaskStatus.FAILED;
+  const nextStatus = result.cancelled
+    ? TaskStatus.CANCELLED
+    : result.success
+      ? TaskStatus.COMPLETED
+      : TaskStatus.FAILED;
   await storage.updateTask(task.id, {
     status: nextStatus,
     plan: result.plan ?? task.plan,
   });
   await storage.createExecutionLog({
     taskId: task.id,
-    message: result.success
-      ? 'Task completed successfully.'
-      : `Task failed: ${result.error ?? 'Unknown error'}`,
-    level: result.success ? LogLevel.INFO : LogLevel.ERROR,
+    message: result.cancelled
+      ? 'Task was cancelled before completion.'
+      : result.success
+        ? 'Task completed successfully.'
+        : `Task failed: ${result.error ?? 'Unknown error'}`,
+    level: result.cancelled ? LogLevel.WARN : result.success ? LogLevel.INFO : LogLevel.ERROR,
   });
   return storage.getTaskById(task.id);
 }
@@ -213,6 +225,25 @@ export async function executeTask(taskId: string): Promise<TaskRecord | null> {
   const task = await storage.getTaskById(taskId);
   if (!task) return null;
 
+  registerTask(task.id);
+  const timeout = setTimeout(() => {
+    requestCancel(task.id);
+    void storage.createExecutionLog({
+      taskId: task.id,
+      message: `Task exceeded the ${Math.round(TASK_TIMEOUT_MS / 1000)}s time limit — cancelling.`,
+      level: LogLevel.WARN,
+    });
+  }, TASK_TIMEOUT_MS);
+
+  try {
+    return await runExecution(task);
+  } finally {
+    clearTimeout(timeout);
+    unregisterTask(task.id);
+  }
+}
+
+async function runExecution(task: TaskRecord): Promise<TaskRecord | null> {
   await storage.updateTask(task.id, { status: TaskStatus.PLANNING });
   await storage.createExecutionLog({
     taskId: task.id,
@@ -258,7 +289,9 @@ export async function executeTask(taskId: string): Promise<TaskRecord | null> {
   const executionContext = createExecutionContext(task, repoContext, repoAccess);
   const { callback: onProgress } = makeProgressCallback(task);
 
-  const result = await coordinator.executeTask(task.prompt, executionContext, onProgress);
+  const result = await coordinator.executeTask(task.prompt, executionContext, onProgress, {
+    shouldCancel: () => isCancelled(task.id),
+  });
 
   if (result.success) {
     await storage.updateTask(task.id, { status: TaskStatus.VALIDATING });

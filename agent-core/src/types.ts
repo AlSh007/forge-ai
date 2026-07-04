@@ -64,6 +64,18 @@ export interface TaskExecutionResult {
   staticValidation?: StaticValidationResult;
   codeChanges?: CodeChange[];
   error?: string;
+  /** True when execution stopped because cancellation was requested. */
+  cancelled?: boolean;
+}
+
+/** Options controlling a single task execution run. */
+export interface ExecuteTaskOptions {
+  /**
+   * Polled between agent steps. When it returns true, execution stops at the next
+   * step boundary and the result is returned with `cancelled: true`. Used for both
+   * user-requested cancellation and the timeout guard.
+   */
+  shouldCancel?: () => boolean | Promise<boolean>;
 }
 
 export interface RepoContext {

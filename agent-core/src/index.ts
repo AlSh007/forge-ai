@@ -1,4 +1,4 @@
-import { AgentStepResult, CodeChange, ExecutionContext, ProgressCallback, TaskExecutionResult } from './types';
+import { AgentStepResult, CodeChange, ExecuteTaskOptions, ExecutionContext, ProgressCallback, TaskExecutionResult } from './types';
 import {
   ProductManagerAgent,
   ArchitectAgent,
@@ -11,6 +11,14 @@ import { validateChanges, formatStaticResults } from './validation/static';
 
 // Keep accumulated context below this to avoid token-per-minute rate limits
 const MAX_CONTEXT_CHARS = 24_000;
+
+/** Thrown internally when a run is cancelled between steps. Not an execution failure. */
+class TaskCancelledError extends Error {
+  constructor() {
+    super('Task cancelled');
+    this.name = 'TaskCancelledError';
+  }
+}
 
 function truncate(text: string, maxChars = MAX_CONTEXT_CHARS): string {
   if (text.length <= maxChars) return text;
@@ -282,10 +290,19 @@ export class AgentCoordinator {
   async executeTask(
     prompt: string,
     context: ExecutionContext,
-    onProgress?: ProgressCallback
+    onProgress?: ProgressCallback,
+    options?: ExecuteTaskOptions
   ): Promise<TaskExecutionResult> {
     const steps: AgentStepResult[] = [];
     console.log(`\nStarting task execution for: ${prompt}\n`);
+
+    // Checked before each agent step. Throws TaskCancelledError so the outer
+    // catch can distinguish a user/timeout cancellation from a real failure.
+    const checkCancelled = async (): Promise<void> => {
+      if (options?.shouldCancel && (await options.shouldCancel())) {
+        throw new TaskCancelledError();
+      }
+    };
 
     // Planning agents (PM, Architect) get just the file tree to stay under
     // the 6K TPM limit of llama-3.1-8b-instant.
@@ -306,6 +323,7 @@ export class AgentCoordinator {
     const dbBase = schemaFiles ? `${plannerBase}\n\n## Schema Files\n${schemaFiles}` : plannerBase;
 
     try {
+      await checkCancelled();
       const plan = await this.runStep(
         this.agents.productManager,
         plannerBase,
@@ -314,6 +332,7 @@ export class AgentCoordinator {
         onProgress
       );
 
+      await checkCancelled();
       const design = await this.runStep(
         this.agents.architect,
         truncate(`${plannerBase}\n\n## Execution Plan\n${plan}`, 12_000),
@@ -322,6 +341,7 @@ export class AgentCoordinator {
         onProgress
       );
 
+      await checkCancelled();
       const dbChanges = await this.runStep(
         this.agents.database,
         truncate(`${dbBase}\n\n## Execution Plan\n${plan}\n\n## Architecture Design\n${design}`),
@@ -330,6 +350,7 @@ export class AgentCoordinator {
         onProgress
       );
 
+      await checkCancelled();
       const backendCode = await this.runStep(
         this.agents.backend,
         truncate(`${codeBase}\n\n## Execution Plan\n${plan}\n\n## Architecture Design\n${design}\n\n## Database Changes\n${dbChanges}`),
@@ -338,6 +359,7 @@ export class AgentCoordinator {
         onProgress
       );
 
+      await checkCancelled();
       const frontendCode = await this.runStep(
         this.agents.frontend,
         // Backend changes are intentionally omitted — when included, the model
@@ -361,6 +383,7 @@ export class AgentCoordinator {
       const staticValidation = validateChanges(codeChanges, context.repoContext?.keyFiles);
       const staticSection = formatStaticResults(staticValidation);
 
+      await checkCancelled();
       // DevOps only needs the task, the plan, and the generated files — not the
       // full repo key-file snapshot. Using plannerBase keeps this under 8K tokens.
       const validation = await this.runStep(
@@ -399,6 +422,10 @@ export class AgentCoordinator {
         codeChanges,
       };
     } catch (error) {
+      if (error instanceof TaskCancelledError) {
+        console.log('Task execution cancelled before completion.');
+        return { success: false, cancelled: true, steps, error: 'Task cancelled.' };
+      }
       console.error('Task execution failed:', error);
       return {
         success: false,

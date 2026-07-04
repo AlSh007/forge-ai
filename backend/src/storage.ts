@@ -102,10 +102,25 @@ export interface CreatePullRequestInput {
   validationResults?: string | null;
 }
 
+export interface ListTasksOptions {
+  limit?: number;
+  offset?: number;
+}
+
+// Statuses that mean a task was mid-execution. If the process died (deploy,
+// crash, free-tier sleep) while a task was in one of these, it is orphaned —
+// nothing will ever move it forward. The reconciler fails these on boot.
+export const ACTIVE_TASK_STATUSES: TaskStatus[] = [
+  TaskStatus.PLANNING,
+  TaskStatus.IN_PROGRESS,
+  TaskStatus.VALIDATING,
+];
+
 interface StorageAdapter {
   connect(): Promise<void>;
-  listTasks(): Promise<TaskRecord[]>;
+  listTasks(options?: ListTasksOptions): Promise<TaskRecord[]>;
   getTaskById(id: string): Promise<TaskRecord | null>;
+  markInterruptedTasksFailed(): Promise<number>;
   createTask(input: CreateTaskInput): Promise<TaskRecord>;
   updateTask(id: string, input: UpdateTaskInput): Promise<TaskRecord | null>;
   createExecution(input: CreateExecutionInput): Promise<AgentExecutionRecord>;
@@ -256,15 +271,37 @@ export class MemoryStorage implements StorageAdapter {
     return Promise.resolve();
   }
 
-  async listTasks(): Promise<TaskRecord[]> {
-    return Array.from(this.tasks.values())
-      .sort((left, right) => right.createdAt.localeCompare(left.createdAt))
-      .map((task) => this.withRelations(task));
+  async listTasks(options?: ListTasksOptions): Promise<TaskRecord[]> {
+    const sorted = Array.from(this.tasks.values()).sort((left, right) =>
+      right.createdAt.localeCompare(left.createdAt)
+    );
+    const offset = options?.offset ?? 0;
+    const windowed =
+      options?.limit != null ? sorted.slice(offset, offset + options.limit) : sorted.slice(offset);
+    return windowed.map((task) => this.withRelations(task));
   }
 
   async getTaskById(id: string): Promise<TaskRecord | null> {
     const task = this.tasks.get(id);
     return task ? this.withRelations(task) : null;
+  }
+
+  async markInterruptedTasksFailed(): Promise<number> {
+    // In-memory storage starts empty on every boot, so there is nothing to
+    // reconcile — but keep the behavior consistent with the Prisma adapter.
+    let count = 0;
+    for (const [id, task] of this.tasks.entries()) {
+      if (ACTIVE_TASK_STATUSES.includes(task.status)) {
+        this.tasks.set(id, { ...task, status: TaskStatus.FAILED, updatedAt: nowIso() });
+        await this.createExecutionLog({
+          taskId: id,
+          message: 'Task was interrupted (server restarted mid-execution) and has been marked FAILED.',
+          level: LogLevel.ERROR,
+        });
+        count++;
+      }
+    }
+    return count;
   }
 
   async createTask(input: CreateTaskInput): Promise<TaskRecord> {
@@ -436,14 +473,39 @@ class PrismaStorage implements StorageAdapter {
     await this.prisma.$connect();
   }
 
-  async listTasks(): Promise<TaskRecord[]> {
+  async listTasks(options?: ListTasksOptions): Promise<TaskRecord[]> {
     const tasks = await this.prisma.task.findMany({
       orderBy: {
         createdAt: 'desc',
       },
+      ...(options?.limit != null && { take: options.limit }),
+      ...(options?.offset != null && { skip: options.offset }),
     });
 
     return tasks.map((task: any) => toTaskRecord(task));
+  }
+
+  async markInterruptedTasksFailed(): Promise<number> {
+    const orphaned = await this.prisma.task.findMany({
+      where: { status: { in: ACTIVE_TASK_STATUSES } },
+      select: { id: true },
+    });
+    if (orphaned.length === 0) return 0;
+
+    await this.prisma.task.updateMany({
+      where: { status: { in: ACTIVE_TASK_STATUSES } },
+      data: { status: TaskStatus.FAILED },
+    });
+
+    await this.prisma.executionLog.createMany({
+      data: orphaned.map((t: { id: string }) => ({
+        taskId: t.id,
+        message: 'Task was interrupted (server restarted mid-execution) and has been marked FAILED.',
+        level: LogLevel.ERROR,
+      })),
+    });
+
+    return orphaned.length;
   }
 
   async getTaskById(id: string): Promise<TaskRecord | null> {
@@ -647,12 +709,16 @@ class ForgeStorage implements StorageAdapter {
     await this.getAdapter();
   }
 
-  async listTasks(): Promise<TaskRecord[]> {
-    return (await this.getAdapter()).listTasks();
+  async listTasks(options?: ListTasksOptions): Promise<TaskRecord[]> {
+    return (await this.getAdapter()).listTasks(options);
   }
 
   async getTaskById(id: string): Promise<TaskRecord | null> {
     return (await this.getAdapter()).getTaskById(id);
+  }
+
+  async markInterruptedTasksFailed(): Promise<number> {
+    return (await this.getAdapter()).markInterruptedTasksFailed();
   }
 
   async createTask(input: CreateTaskInput): Promise<TaskRecord> {
@@ -702,8 +768,18 @@ class ForgeStorage implements StorageAdapter {
     }
 
     this.resolved = true;
+    const isProduction = process.env.NODE_ENV === 'production';
 
     if (!process.env.DATABASE_URL) {
+      // In production the in-memory store is never acceptable — data would vanish
+      // on every restart and silently diverge across instances. Fail loudly so the
+      // misconfiguration is caught at boot instead of after data loss.
+      if (isProduction) {
+        throw new Error(
+          'DATABASE_URL is not set in production. Refusing to start with the in-memory store ' +
+            '(data would be lost on every restart). Set DATABASE_URL or explicitly run in development.'
+        );
+      }
       this.adapter = this.memoryStorage;
       this.mode = 'memory';
       return this.adapter;
@@ -715,6 +791,16 @@ class ForgeStorage implements StorageAdapter {
       this.adapter = this.prismaStorage;
       this.mode = 'prisma';
     } catch (error) {
+      // A DB was configured but is unreachable. In production, do NOT degrade to
+      // in-memory — that hides an outage and loses writes. Crash so the platform
+      // restarts us and the failure is visible.
+      if (isProduction) {
+        throw new Error(
+          `DATABASE_URL is set but the database is unreachable: ${
+            error instanceof Error ? error.message : 'Unknown error'
+          }. Refusing to fall back to in-memory storage in production.`
+        );
+      }
       console.warn(
         'Database unavailable, falling back to in-memory storage:',
         error instanceof Error ? error.message : 'Unknown error'

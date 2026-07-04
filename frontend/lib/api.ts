@@ -117,6 +117,8 @@ export const executionApi = {
     (await apiClient.get(`/api/executions?taskId=${taskId}`)).data,
   startExecution: async (taskId: string): Promise<TaskResponse> =>
     (await apiClient.post(`/api/tasks/${taskId}/execute`)).data,
+  cancel: async (taskId: string): Promise<TaskResponse> =>
+    (await apiClient.post(`/api/tasks/${taskId}/cancel`)).data,
 };
 
 export const systemApi = {
