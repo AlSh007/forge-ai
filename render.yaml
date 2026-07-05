@@ -3,7 +3,7 @@ services:
     name: forgeai-backend
     env: node
     plan: free
-    buildCommand: npm install --include=dev && npm run build -w agent-core && npm run build -w backend && npx prisma generate --schema=backend/prisma/schema.prisma
+    buildCommand: npm install --include=dev && npm run build -w agent-core && npx prisma generate --schema=backend/prisma/schema.prisma && npm run build -w backend
     startCommand: sh scripts/db-migrate.sh && npm run start -w backend
     healthCheckPath: /health
     envVars:
