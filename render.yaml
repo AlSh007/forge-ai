@@ -19,7 +19,7 @@ services:
         sync: false
       - key: DIRECT_URL
         sync: false
-      - key: SUPABASE_JWT_SECRET
+      - key: SUPABASE_URL
         sync: false
       - key: TOKEN_ENCRYPTION_KEY
         sync: false

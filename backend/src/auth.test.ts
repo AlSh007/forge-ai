@@ -1,8 +1,34 @@
-import jwt from 'jsonwebtoken';
+import { generateKeyPairSync } from 'crypto';
+import jwt, { GetPublicKeyOrSecret } from 'jsonwebtoken';
 import type { Request, Response, NextFunction } from 'express';
-import { requireAuth } from './auth';
+import { createRequireAuth, requireAuth } from './auth';
 
-const SECRET = 'test-supabase-jwt-secret';
+// A project signing key pair (ES256 / P-256), and a second, unrelated pair used to
+// simulate a token signed by the wrong key.
+function ecKeyPair() {
+  const { publicKey, privateKey } = generateKeyPairSync('ec', { namedCurve: 'P-256' });
+  return {
+    publicPem: publicKey.export({ type: 'spki', format: 'pem' }) as string,
+    privatePem: privateKey.export({ type: 'pkcs8', format: 'pem' }) as string,
+  };
+}
+
+const project = ecKeyPair();
+const attacker = ecKeyPair();
+
+// Key resolver that always returns the project's public key (stands in for the
+// remote JWKS lookup by kid).
+const getKey: GetPublicKeyOrSecret = (_header, cb) => cb(null, project.publicPem);
+const requireAuthTest = createRequireAuth(getKey);
+
+function sign(payload: object, privatePem: string = project.privatePem, opts: jwt.SignOptions = {}) {
+  return jwt.sign(payload, privatePem, {
+    algorithm: 'ES256',
+    expiresIn: '1h',
+    audience: 'authenticated',
+    ...opts,
+  });
+}
 
 function mockRes() {
   const res: Partial<Response> & { statusCode?: number; body?: unknown } = {};
@@ -21,34 +47,13 @@ function mockReq(authHeader?: string): Request {
   return { headers: authHeader ? { authorization: authHeader } : {} } as Request;
 }
 
-function sign(payload: object, secret = SECRET): string {
-  return jwt.sign(payload, secret, {
-    algorithm: 'HS256',
-    expiresIn: '1h',
-    audience: 'authenticated',
-  });
-}
-
-describe('requireAuth middleware', () => {
-  const ORIGINAL_SECRET = process.env.SUPABASE_JWT_SECRET;
-
-  beforeEach(() => {
-    process.env.SUPABASE_JWT_SECRET = SECRET;
-  });
-  afterAll(() => {
-    process.env.SUPABASE_JWT_SECRET = ORIGINAL_SECRET;
-  });
-
+describe('requireAuth middleware (JWKS / ES256)', () => {
   it('accepts a valid token and sets req.userId', async () => {
     const req = mockReq(`Bearer ${sign({ sub: 'sb-user-1', email: 'a@example.com' })}`);
-    const res = mockRes();
     let called = false;
-    const next: NextFunction = () => {
+    await requireAuthTest(req, mockRes(), (() => {
       called = true;
-    };
-
-    await requireAuth(req, res, next);
-
+    }) as NextFunction);
     expect(called).toBe(true);
     expect(typeof req.userId).toBe('string');
     expect(req.userId!.length).toBeGreaterThan(0);
@@ -59,22 +64,22 @@ describe('requireAuth middleware', () => {
     const r1 = mockReq(token);
     const r2 = mockReq(token);
     const noop: NextFunction = () => undefined;
-    await requireAuth(r1, mockRes(), noop);
-    await requireAuth(r2, mockRes(), noop);
+    await requireAuthTest(r1, mockRes(), noop);
+    await requireAuthTest(r2, mockRes(), noop);
     expect(r1.userId).toBe(r2.userId);
   });
 
   it('rejects a missing Authorization header with 401', async () => {
     const res = mockRes();
-    await requireAuth(mockReq(), res, (() => undefined) as NextFunction);
+    await requireAuthTest(mockReq(), res, (() => undefined) as NextFunction);
     expect(res.statusCode).toBe(401);
   });
 
-  it('rejects a token signed with the wrong secret with 401', async () => {
+  it('rejects a token signed by the wrong key with 401', async () => {
     const res = mockRes();
-    const bad = `Bearer ${sign({ sub: 'x', email: 'x@example.com' }, 'wrong-secret')}`;
+    const bad = `Bearer ${sign({ sub: 'x', email: 'x@example.com' }, attacker.privatePem)}`;
     let called = false;
-    await requireAuth(mockReq(bad), res, (() => {
+    await requireAuthTest(mockReq(bad), res, (() => {
       called = true;
     }) as NextFunction);
     expect(res.statusCode).toBe(401);
@@ -83,18 +88,23 @@ describe('requireAuth middleware', () => {
 
   it('rejects an expired token with 401', async () => {
     const res = mockRes();
-    const expired = jwt.sign({ sub: 'x', email: 'x@example.com' }, SECRET, {
-      algorithm: 'HS256',
-      expiresIn: -10,
-      audience: 'authenticated',
+    const expired = sign({ sub: 'x', email: 'x@example.com' }, project.privatePem, { expiresIn: -10 });
+    await requireAuthTest(mockReq(`Bearer ${expired}`), res, (() => undefined) as NextFunction);
+    expect(res.statusCode).toBe(401);
+  });
+
+  it('rejects a token with the wrong audience with 401', async () => {
+    const res = mockRes();
+    const wrongAud = sign({ sub: 'x', email: 'x@example.com' }, project.privatePem, {
+      audience: 'some-other-service',
     });
-    await requireAuth(mockReq(`Bearer ${expired}`), res, (() => undefined) as NextFunction);
+    await requireAuthTest(mockReq(`Bearer ${wrongAud}`), res, (() => undefined) as NextFunction);
     expect(res.statusCode).toBe(401);
   });
 
   it('rejects a token missing required claims with 401', async () => {
     const res = mockRes();
-    await requireAuth(
+    await requireAuthTest(
       mockReq(`Bearer ${sign({ sub: 'no-email' })}`),
       res,
       (() => undefined) as NextFunction
@@ -102,25 +112,13 @@ describe('requireAuth middleware', () => {
     expect(res.statusCode).toBe(401);
   });
 
-  it('rejects a token with the wrong audience with 401', async () => {
+  it('returns 500 when SUPABASE_URL is not configured (production middleware)', async () => {
+    const original = process.env.SUPABASE_URL;
+    delete process.env.SUPABASE_URL;
     const res = mockRes();
-    const wrongAud = jwt.sign({ sub: 'x', email: 'x@example.com' }, SECRET, {
-      algorithm: 'HS256',
-      expiresIn: '1h',
-      audience: 'some-other-service',
-    });
-    await requireAuth(mockReq(`Bearer ${wrongAud}`), res, (() => undefined) as NextFunction);
-    expect(res.statusCode).toBe(401);
-  });
-
-  it('returns 500 when the server secret is not configured', async () => {
-    delete process.env.SUPABASE_JWT_SECRET;
-    const res = mockRes();
-    await requireAuth(
-      mockReq('Bearer whatever'),
-      res,
-      (() => undefined) as NextFunction
-    );
+    requireAuth(mockReq('Bearer whatever'), res, (() => undefined) as NextFunction);
+    // requireAuth is synchronous up to the config check.
     expect(res.statusCode).toBe(500);
+    process.env.SUPABASE_URL = original;
   });
 });
