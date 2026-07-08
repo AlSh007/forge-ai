@@ -1,4 +1,4 @@
-import { AgentStepResult, CodeChange, ExecuteTaskOptions, ExecutionContext, ProgressCallback, TaskExecutionResult } from './types';
+import { AgentStepResult, CodeChange, ExecuteTaskOptions, ExecutionContext, ProgressCallback, RepairSummary, StaticValidationResult, TaskExecutionResult } from './types';
 import {
   ProductManagerAgent,
   ArchitectAgent,
@@ -133,6 +133,14 @@ function extractJsonObject(raw: string): string {
   const fenced = stripped.match(/```(?:json)?\s*([\s\S]+?)\s*```/);
   if (fenced) return fenced[1];
   return stripped;
+}
+
+/** The three agents that emit code files, in the order they run. */
+const CODE_AGENT_NAMES = ['Database', 'Backend', 'Frontend'] as const;
+type CodeAgentName = (typeof CODE_AGENT_NAMES)[number];
+
+function errorCount(result: StaticValidationResult): number {
+  return result.issues.filter((i) => i.severity === 'error').length;
 }
 
 function parseCodeChanges(output: string): CodeChange[] {
@@ -372,15 +380,45 @@ export class AgentCoordinator {
 
       // Collect generated files and statically validate them before the DevOps
       // review, so the reviewer reasons over real, deterministic findings.
-      const codeChanges = collectCodeChanges(
-        [
-          { name: 'Database', output: dbChanges },
-          { name: 'Backend', output: backendCode },
-          { name: 'Frontend', output: frontendCode },
-        ],
-        context.repoContext
-      );
-      const staticValidation = validateChanges(codeChanges, context.repoContext?.keyFiles);
+      const repoPaths = context.repoContext?.structure
+        ? context.repoContext.structure.split('\n').map((p) => p.trim()).filter(Boolean)
+        : [];
+      const validateOutputs = (outputs: Record<CodeAgentName, string>) => {
+        const changes = collectCodeChanges(
+          CODE_AGENT_NAMES.map((name) => ({ name, output: outputs[name] })),
+          context.repoContext
+        );
+        return { changes, result: validateChanges(changes, context.repoContext?.keyFiles, repoPaths) };
+      };
+
+      const codeOutputs: Record<CodeAgentName, string> = {
+        Database: dbChanges,
+        Backend: backendCode,
+        Frontend: frontendCode,
+      };
+      let { changes: codeChanges, result: staticValidation } = validateOutputs(codeOutputs);
+      let repair: RepairSummary | undefined;
+
+      // Repair loop: when the deterministic checks fail, feed the exact errors
+      // back to the agents that produced the offending files for one corrective
+      // pass. The repaired output is adopted only if it strictly reduces the
+      // error count, so a botched repair can never make the result worse.
+      if (!staticValidation.ok) {
+        const errorsBefore = errorCount(staticValidation);
+        const { outputs: repaired, agents: repairedAgents } = await this.repairCodeOutputs(codeOutputs, staticValidation, context, steps, onProgress, checkCancelled);
+        const { changes: repairedChanges, result: repairedValidation } = validateOutputs(repaired);
+        const errorsAfter = errorCount(repairedValidation);
+        const adopted = errorsAfter < errorsBefore;
+        if (adopted) {
+          console.log(`[coordinator] Repair pass reduced static errors ${errorsBefore} → ${errorsAfter}.`);
+          Object.assign(codeOutputs, repaired);
+          codeChanges = repairedChanges;
+          staticValidation = repairedValidation;
+        } else {
+          console.log(`[coordinator] Repair pass did not reduce static errors (${errorsBefore}) — keeping original output.`);
+        }
+        repair = { agents: repairedAgents, errorsBefore, errorsAfter, adopted };
+      }
       const staticSection = formatStaticResults(staticValidation);
 
       await checkCancelled();
@@ -389,7 +427,7 @@ export class AgentCoordinator {
       const validation = await this.runStep(
         this.agents.devops,
         truncate(
-          `${plannerBase}\n\n## Execution Plan\n${plan}\n\n## Architecture Design\n${design}\n\n## Database Changes\n${dbChanges}\n\n## Backend Changes\n${backendCode}\n\n## Frontend Changes\n${frontendCode}\n\n## Static Validation Results (deterministic, authoritative)\n${staticSection}`,
+          `${plannerBase}\n\n## Execution Plan\n${plan}\n\n## Architecture Design\n${design}\n\n## Database Changes\n${codeOutputs.Database}\n\n## Backend Changes\n${codeOutputs.Backend}\n\n## Frontend Changes\n${codeOutputs.Frontend}\n\n## Static Validation Results (deterministic, authoritative)\n${staticSection}`,
           20_000
         ),
         context,
@@ -412,13 +450,14 @@ export class AgentCoordinator {
         steps,
         plan,
         design,
-        dbChanges,
-        backendCode,
-        frontendCode,
+        dbChanges: codeOutputs.Database,
+        backendCode: codeOutputs.Backend,
+        frontendCode: codeOutputs.Frontend,
         validation,
         validationPassed,
         validationReason,
         staticValidation,
+        repair,
         codeChanges,
       };
     } catch (error) {
@@ -433,6 +472,87 @@ export class AgentCoordinator {
         error: error instanceof Error ? error.message : 'Unknown error',
       };
     }
+  }
+
+  /**
+   * Single corrective pass over the code agents whose files failed static
+   * validation. Each such agent is re-prompted with its previous output and the
+   * exact, deterministic errors, and asked to return corrected files. Errors that
+   * can't be attributed to a specific file (e.g. a change missing its path) are
+   * routed to every agent that produced files. Best-effort: an agent whose repair
+   * attempt throws or yields no parseable files keeps its original output — the
+   * caller only adopts the result if it reduces the total error count.
+   */
+  private async repairCodeOutputs(
+    codeOutputs: Record<CodeAgentName, string>,
+    validation: StaticValidationResult,
+    context: ExecutionContext,
+    steps: AgentStepResult[],
+    onProgress: ProgressCallback | undefined,
+    checkCancelled: () => Promise<void>
+  ): Promise<{ outputs: Record<CodeAgentName, string>; agents: string[] }> {
+    const errors = validation.issues.filter((i) => i.severity === 'error');
+    if (errors.length === 0) return { outputs: codeOutputs, agents: [] };
+
+    const agentByName = {
+      Database: this.agents.database,
+      Backend: this.agents.backend,
+      Frontend: this.agents.frontend,
+    };
+
+    // Map each generated file path to the agent that first produced it.
+    const owner = new Map<string, CodeAgentName>();
+    for (const name of CODE_AGENT_NAMES) {
+      for (const change of parseCodeChanges(codeOutputs[name])) {
+        const p = (change.path ?? '').trim();
+        if (p && !owner.has(p)) owner.set(p, name);
+      }
+    }
+
+    const hasUnowned = errors.some((e) => !owner.has(e.path.trim()));
+    const producers = CODE_AGENT_NAMES.filter((name) => parseCodeChanges(codeOutputs[name]).length > 0);
+    const toRepair = new Set<CodeAgentName>();
+    for (const e of errors) {
+      const name = owner.get(e.path.trim());
+      if (name) toRepair.add(name);
+    }
+    if (hasUnowned) producers.forEach((n) => toRepair.add(n));
+
+    const repaired: Record<CodeAgentName, string> = { ...codeOutputs };
+    const repairedAgents: string[] = [];
+    for (const name of CODE_AGENT_NAMES) {
+      if (!toRepair.has(name)) continue;
+      repairedAgents.push(name);
+      await checkCancelled();
+
+      const relevant = errors.filter((e) => owner.get(e.path.trim()) === name || !owner.has(e.path.trim()));
+      const errorList = relevant.map((e) => `- ${e.path}: ${e.message}`).join('\n');
+      const agent = agentByName[name];
+      const repairInput =
+        `Your previous output for this task failed deterministic validation. Fix every error and return the corrected files.\n\n` +
+        `## Your previous output\n${truncate(codeOutputs[name], 12_000)}\n\n` +
+        `## Validation errors (deterministic and authoritative — each MUST be resolved)\n${errorList}\n\n` +
+        `## Instructions\n` +
+        `- Return the COMPLETE corrected set of changed files as {"files":[{"path":"...","content":"..."}]} JSON — the same format as before.\n` +
+        `- For a dangling import: either add the missing file to "files" with real content, or change the import to a path that already exists.\n` +
+        `- For a syntax or JSON error: emit valid, complete file content.\n` +
+        `- Do not re-emit files that were already correct, and do not introduce new errors.`;
+
+      try {
+        const out = await this.runStep(
+          { name: `${agent.name} (repair)`, type: agent.type, run: agent.run.bind(agent) },
+          repairInput,
+          context,
+          steps,
+          onProgress
+        );
+        if (parseCodeChanges(out).length > 0) repaired[name] = out;
+      } catch (err) {
+        if (err instanceof TaskCancelledError) throw err;
+        console.warn(`[coordinator] Repair pass for ${name} failed: ${err instanceof Error ? err.message : 'unknown'}. Keeping original output.`);
+      }
+    }
+    return { outputs: repaired, agents: repairedAgents };
   }
 
   private async runStep(

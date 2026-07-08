@@ -50,6 +50,18 @@ export interface StaticValidationResult {
   filesChecked: number;
 }
 
+/** Outcome of the automatic repair pass, when static validation initially failed. */
+export interface RepairSummary {
+  /** Display names of the agents that were re-prompted (e.g. `['Frontend']`). */
+  agents: string[];
+  /** Static error count before the repair pass. */
+  errorsBefore: number;
+  /** Static error count after the repair pass (whether or not it was adopted). */
+  errorsAfter: number;
+  /** True when the repaired output was kept (it strictly reduced the error count). */
+  adopted: boolean;
+}
+
 export interface TaskExecutionResult {
   success: boolean;
   steps: AgentStepResult[];
@@ -62,6 +74,8 @@ export interface TaskExecutionResult {
   validationPassed?: boolean;
   validationReason?: string;
   staticValidation?: StaticValidationResult;
+  /** Present when the automatic repair pass ran (i.e. static validation initially failed). */
+  repair?: RepairSummary;
   codeChanges?: CodeChange[];
   error?: string;
   /** True when execution stopped because cancellation was requested. */

@@ -53,8 +53,28 @@ const PIPELINE_ORDER: AgentType[] = [
 
 type PipelineStatus = 'pending' | 'running' | 'done' | 'failed';
 
+/**
+ * The most recent execution for an agent. An agent whose files failed static
+ * validation is re-run by the auto-repair pass, producing a second execution of
+ * the same type — the latest one carries the corrected output, so we surface it.
+ */
+function latestExec(
+  agentType: AgentType,
+  executions: AgentExecutionRecord[]
+): AgentExecutionRecord | undefined {
+  const list = executions.filter((e) => e.agentType === agentType);
+  if (list.length === 0) return undefined;
+  return list.reduce((a, b) =>
+    new Date(b.createdAt).getTime() >= new Date(a.createdAt).getTime() ? b : a
+  );
+}
+
+function wasRepaired(agentType: AgentType, executions: AgentExecutionRecord[]): boolean {
+  return executions.filter((e) => e.agentType === agentType).length > 1;
+}
+
 function getStatus(agentType: AgentType, executions: AgentExecutionRecord[]): PipelineStatus {
-  const exec = executions.find((e) => e.agentType === agentType);
+  const exec = latestExec(agentType, executions);
   if (!exec) return 'pending';
   if (exec.status === 'RUNNING') return 'running';
   if (exec.status === 'SUCCESS') return 'done';
@@ -377,15 +397,28 @@ function RunningCard({ meta }: { meta: AgentMeta }) {
   );
 }
 
+function RepairedBadge() {
+  return (
+    <span
+      title="This agent's output failed validation and was automatically re-generated and fixed."
+      className="flex-shrink-0 inline-flex items-center gap-1 rounded px-1.5 py-px text-[9px] font-mono uppercase tracking-wide bg-amber-500/10 text-amber-400/90 border border-amber-500/20 select-none"
+    >
+      <span aria-hidden="true">🔧</span> auto-repaired
+    </span>
+  );
+}
+
 function DoneCard({
   meta,
   exec,
   isActive,
+  repaired,
   onClick,
 }: {
   meta: AgentMeta;
   exec: AgentExecutionRecord;
   isActive: boolean;
+  repaired: boolean;
   onClick: () => void;
 }) {
   const preview = exec.output ? getOutputPreview(exec.output) : null;
@@ -412,8 +445,9 @@ function DoneCard({
             <span className="text-[11px] text-slate-500 font-mono truncate">{preview}</span>
           </>
         )}
+        {repaired && <span className="ml-auto"><RepairedBadge /></span>}
         {hasOutput && (
-          <span className={`ml-auto flex-shrink-0 transition-transform duration-150 ${isActive ? 'rotate-90' : ''}`}>
+          <span className={`${repaired ? '' : 'ml-auto'} flex-shrink-0 transition-transform duration-150 ${isActive ? 'rotate-90' : ''}`}>
             <svg width="9" height="9" viewBox="0 0 9 9" fill="none" aria-hidden="true">
               <path d="M2 1.5l4.5 3L2 7.5" stroke={isActive ? '#94a3b8' : '#475569'} strokeWidth="1.2" strokeLinecap="round" strokeLinejoin="round" />
             </svg>
@@ -459,7 +493,7 @@ export function AgentPipeline({ task }: { task: TaskDetails }) {
   }
 
   const activeExec = activeAgent
-    ? task.executions.find((e) => e.agentType === activeAgent) ?? null
+    ? latestExec(activeAgent, task.executions) ?? null
     : null;
 
   return (
@@ -483,8 +517,9 @@ export function AgentPipeline({ task }: { task: TaskDetails }) {
           const status = getStatus(agentType, task.executions);
           const nextType = PIPELINE_ORDER[index + 1];
           const nextStatus = nextType ? getStatus(nextType, task.executions) : 'pending';
-          const exec = task.executions.find((e) => e.agentType === agentType);
+          const exec = latestExec(agentType, task.executions);
           const meta = AGENT_META[agentType];
+          const repaired = wasRepaired(agentType, task.executions);
           const isLast = index === PIPELINE_ORDER.length - 1;
           const isActiveAgent = activeAgent === agentType;
 
@@ -509,6 +544,7 @@ export function AgentPipeline({ task }: { task: TaskDetails }) {
                       meta={meta}
                       exec={exec}
                       isActive={isActiveAgent}
+                      repaired={repaired}
                       onClick={() => toggleAgent(agentType)}
                     />
                     {isActiveAgent && activeExec && (

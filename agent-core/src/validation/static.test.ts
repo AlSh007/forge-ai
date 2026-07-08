@@ -74,6 +74,79 @@ describe('validateChanges', () => {
     expect(result.issues[0].severity).toBe('error');
   });
 
+  describe('relative import resolution', () => {
+    const tree = ['src/index.ts', 'src/services/user.ts', 'src/utils/index.ts', 'components/Card.tsx'];
+
+    it('rejects a relative import that resolves to no known file', () => {
+      const result = validateChanges(
+        [{ path: 'src/index.ts', content: 'import { getUser } from "./services/missing";\nexport const x = getUser;' }],
+        {},
+        tree
+      );
+      expect(result.ok).toBe(false);
+      expect(result.issues.some((i) => i.message.includes('dangling import'))).toBe(true);
+    });
+
+    it('accepts a relative import to an existing repo file (extensionless)', () => {
+      expect(
+        validateChanges(
+          [{ path: 'src/index.ts', content: 'import { u } from "./services/user";\nexport const x = u;' }],
+          {},
+          tree
+        ).ok
+      ).toBe(true);
+    });
+
+    it('accepts a relative import to a sibling file generated in the same run', () => {
+      expect(
+        validateChanges(
+          [
+            { path: 'src/a.ts', content: 'import { b } from "./b";\nexport const a = b;' },
+            { path: 'src/b.ts', content: 'export const b = 1;' },
+          ],
+          {},
+          tree
+        ).ok
+      ).toBe(true);
+    });
+
+    it('resolves a directory import to its index file', () => {
+      expect(
+        validateChanges(
+          [{ path: 'src/index.ts', content: 'import { helper } from "./utils";\nexport const x = helper;' }],
+          {},
+          tree
+        ).ok
+      ).toBe(true);
+    });
+
+    it('rewrites an ESM .js specifier to a .ts source', () => {
+      expect(
+        validateChanges(
+          [{ path: 'src/index.ts', content: 'import { u } from "./services/user.js";\nexport const x = u;' }],
+          {},
+          tree
+        ).ok
+      ).toBe(true);
+    });
+
+    it('does not flag bare or aliased imports', () => {
+      const result = validateChanges(
+        [{ path: 'src/index.ts', content: 'import express from "express";\nimport { c } from "@/components/Card";\nexport const x = { express, c };' }],
+        {},
+        tree
+      );
+      expect(result.ok).toBe(true);
+    });
+
+    it('skips import checks entirely when no repo tree is provided', () => {
+      // Without a tree we cannot distinguish "missing" from "unknown" — fail open.
+      expect(
+        validateChanges([{ path: 'src/index.ts', content: 'import { z } from "./nowhere";\nexport const x = z;' }]).ok
+      ).toBe(true);
+    });
+  });
+
   it('validates multiple files together and counts them', () => {
     const result = validateChanges([
       { path: 'src/api/users.ts', content: 'import express from "express";\nexport const r = express.Router();' },

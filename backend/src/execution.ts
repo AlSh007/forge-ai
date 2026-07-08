@@ -315,6 +315,19 @@ async function runExecution(task: TaskRecord): Promise<TaskRecord | null> {
   if (result.success) {
     await storage.updateTask(task.id, { status: TaskStatus.VALIDATING });
 
+    if (result.repair) {
+      const { agents, errorsBefore, errorsAfter, adopted } = result.repair;
+      const who = agents.join(', ') || 'code agents';
+      const message = adopted
+        ? `🔧 Auto-repair: re-prompted ${who} and fixed ${errorsBefore - errorsAfter} of ${errorsBefore} static error(s) (${errorsBefore} → ${errorsAfter}).`
+        : `🔧 Auto-repair: re-prompted ${who} but the ${errorsBefore} static error(s) were not reduced — kept the original output.`;
+      await storage.createExecutionLog({
+        taskId: task.id,
+        message,
+        level: adopted && errorsAfter === 0 ? LogLevel.INFO : LogLevel.WARN,
+      });
+    }
+
     if (result.staticValidation) {
       await storage.createExecutionLog({
         taskId: task.id,
