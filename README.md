@@ -99,26 +99,4 @@ Forge-AI/
 
 | Variable | Location | Required | Description |
 |---|---|---|---|
-| `GROQ_API_KEY` | `backend/.env` | Yes | From console.groq.com |
-| `GITHUB_TOKEN` | `backend/.env` | No | Enables branch + PR creation |
-| `DATABASE_URL` | `backend/.env` | No | PostgreSQL; omit for in-memory |
-| `PORT` | `backend/.env` | No | Defaults to 4000 |
-| `NEXT_PUBLIC_API_URL` | `frontend/.env.local` | No | Defaults to `http://localhost:4000` |
-
-## Commands
-
-```bash
-npm run dev              # Start all (builds agent-core first)
-npm run build            # Build all workspaces
-npm run dev -w backend   # Backend only (requires agent-core built)
-npm run dev -w frontend  # Frontend only
-npm run dev -w agent-core # TypeScript watch mode
-
-npm run migrate -w backend       # Run Prisma migrations
-npm run db:push -w backend       # Sync schema without migration
-npm run prisma:studio -w backend # Prisma GUI
-```
-
-## License
-
-MIT
+| `
