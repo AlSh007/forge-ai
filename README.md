@@ -4,7 +4,7 @@ Autonomous AI coding agent platform. Submit a development task and a GitHub repo
 
 ## Demo
 
-[![ForgeAI demo](docs/demo/brag.jpg)](docs/demo/brag.mp4)
+https://github.com/user-attachments/assets/035f618c-4ec0-43aa-8ac2-15473ddba129
 
 *~23s walkthrough: one task goes in, six agents run down the live pipeline, DevOps returns a verdict, a PR opens. The repo name (`acme/storefront-api`) and the generated code in the video are illustrative stand-ins, not real output.*
 
