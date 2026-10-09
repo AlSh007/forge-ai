@@ -93,7 +93,7 @@ Prompts are limited to 2000 characters and `repositoryUrl` must be a `https://gi
 ## Project structure
 
 ```
-Forge-AI/
+forge-ai/
 ├── agent-core/src/
 │   ├── index.ts          AgentCoordinator — sequences agents, threads context, repair pass
 │   ├── agents/base.ts    6 agent classes with specialized system prompts
